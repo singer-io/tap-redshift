@@ -8,7 +8,6 @@ import sys
 import simplejson as json
 
 import psycopg2
-from psycopg2 import sql
 import singer
 import singer.metrics as metrics
 from singer import metadata
