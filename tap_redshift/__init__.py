@@ -34,7 +34,12 @@ REQUIRED_CONFIG_KEYS = [
 STRING_TYPES = {'char', 'character', 'nchar', 'bpchar', 'text', 'varchar',
                 'character varying', 'nvarchar'}
 
-INTEGER_TYPES = {'bigint', 'int2', 'int', 'int4', 'int8'}
+BYTES_FOR_INTEGER_TYPE = {
+    'int2': 2,
+    'int': 4,
+    'int4': 4,
+    'int8': 8
+}
 
 FLOAT_TYPES = {'float', 'float4', 'float8'}
 
@@ -49,51 +54,71 @@ CONFIG = {}
 def discover_catalog(conn, db_schema):
     '''Returns a Catalog describing the structure of the database.'''
 
-    # Use the pg_table_def table for discovery
-    # See: https://docs.aws.amazon.com/redshift/latest/dg/r_PG_TABLE_DEF.html
-    execute(conn, """set search_path to %s;""", (db_schema,))
-    pg_table_def_columns = ["schemaname", "tablename", "column", "type", "encoding", "distkey", "sortkey", "notnull"]
-    column_info_raw = execute(conn, """ select "{}"
-                                        from pg_table_def
-                                        where schemaname != 'pg_catalog'
-                                        order by schemaname, tablename """.format('", "'.join(pg_table_def_columns)))
+    query_params = (db_schema,)
 
-    # Structure: {schema: {table: [{schemaname: thing, tablename: chicken, ...}, ...]
-    schema_info = {schema: {table: [dict(zip(pg_table_def_columns, c)) for c in columns]
-                            for table, columns in groupby(tables, lambda t: t[1])}
-                   for schema, tables
-                   in groupby(column_info_raw, lambda t: t[0])}
-    
+    table_query = """SELECT table_name, table_type
+                       FROM INFORMATION_SCHEMA.Tables
+                      WHERE table_schema = %s"""
+
+    table_specs = select_all(conn, table_query, query_params)
+
+    column_query = """SELECT c.table_name, c.ordinal_position, c.column_name,
+                             c.udt_name, c.is_nullable
+                        FROM INFORMATION_SCHEMA.Tables t
+                        JOIN INFORMATION_SCHEMA.Columns c
+                          ON c.table_name = t.table_name
+                       WHERE t.table_schema = %s
+                    ORDER BY c.table_name, c.ordinal_position"""
+
+    column_specs = select_all(conn, column_query, query_params)
+
+    pk_query = """SELECT kc.table_name, kc.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kc
+                      ON kc.table_name = tc.table_name
+                     AND kc.table_schema = tc.table_schema
+                     AND kc.constraint_name = tc.constraint_name
+                   WHERE tc.constraint_type = 'PRIMARY KEY'
+                     AND tc.table_schema = %s
+                ORDER BY tc.table_schema, tc.table_name, kc.ordinal_position"""
+
+    pk_specs = select_all(conn, pk_query, query_params)
+
     entries = []
-    # TODO: How to get PKs using this method? Does it even make sense
-    #       to have PKs for redshift since it's not enforced??
-    table_pks = {}
-    # TODO: Table Types, can't differentiate between views and tables with this method
-    #       - Are views actually retrieved?
-    table_types = {}
-    for schema_name, tables in schema_info.items():
-        for table_name, columns in tables.items():
-            qualified_table_name = '{}.{}'.format(schema_name, table_name)
-            schema = Schema(type='object',
-                            properties={
-                                c['column']: schema_for_column(c) for c in columns})
-            key_properties = [
-                column for column in table_pks.get(table_name, [])
-                if schema.properties[column].inclusion != 'unsupported']
-            is_view = table_types.get(table_name) == 'VIEW'
-            db_name = conn.get_dsn_parameters()['dbname']
-            metadata = create_metadata(
-                db_name, db_schema, columns, is_view, key_properties)
-            tap_stream_id = '{}.{}'.format(
-                db_name, qualified_table_name)
-            entry = CatalogEntry(
-                tap_stream_id=tap_stream_id,
-                stream=table_name,
-                schema=schema,
-                table=qualified_table_name,
-                metadata=metadata)
+    table_columns = [{'name': k, 'columns': [
+        {'pos': t[1], 'name': t[2], 'type': t[3],
+         'nullable': t[4]} for t in v]}
+                     for k, v in groupby(column_specs, key=lambda t: t[0])]
 
-            entries.append(entry)
+    table_pks = {k: [t[1] for t in v]
+                 for k, v in groupby(pk_specs, key=lambda t: t[0])}
+
+    table_types = dict(table_specs)
+
+    for items in table_columns:
+        table_name = items['name']
+        qualified_table_name = '{}.{}'.format(db_schema, table_name)
+        cols = items['columns']
+        schema = Schema(type='object',
+                        properties={
+                            c['name']: schema_for_column(c) for c in cols})
+        key_properties = [
+            column for column in table_pks.get(table_name, [])
+            if schema.properties[column].inclusion != 'unsupported']
+        is_view = table_types.get(table_name) == 'VIEW'
+        db_name = conn.get_dsn_parameters()['dbname']
+        metadata = create_column_metadata(
+            db_name, cols, is_view, table_name, key_properties)
+        tap_stream_id = '{}.{}'.format(
+            db_name, qualified_table_name)
+        entry = CatalogEntry(
+            tap_stream_id=tap_stream_id,
+            stream=table_name,
+            schema=schema,
+            table=qualified_table_name,
+            metadata=metadata)
+
+        entries.append(entry)
 
     return Catalog(entries)
 
@@ -107,15 +132,18 @@ def do_discover(conn, db_schema):
 def schema_for_column(c):
     '''Returns the Schema object for the given Column.'''
     column_type = c['type'].lower()
-    column_nullable = not c['notnull']
+    column_nullable = c['nullable'].lower()
     inclusion = 'available'
     result = Schema(inclusion=inclusion)
 
     if column_type == 'bool':
         result.type = 'boolean'
 
-    elif column_type in INTEGER_TYPES:
+    elif column_type in BYTES_FOR_INTEGER_TYPE:
         result.type = 'integer'
+        bits = BYTES_FOR_INTEGER_TYPE[column_type] * 8
+        result.minimum = 0 - 2 ** (bits - 1)
+        result.maximum = 2 ** (bits - 1) - 1
 
     elif column_type in FLOAT_TYPES:
         result.type = 'number'
@@ -146,10 +174,10 @@ def schema_for_column(c):
     return result
 
 
-def create_metadata(
-        db_name, db_schema, cols, is_view, key_properties=[]):
+def create_column_metadata(
+        db_name, cols, is_view,
+        table_name, key_properties=[]):
     mdata = metadata.new()
-    # TODO: This should follow other DB patterns
     mdata = metadata.write(mdata, (), 'selected-by-default', False)
     if not is_view:
         mdata = metadata.write(
@@ -158,27 +186,26 @@ def create_metadata(
         mdata = metadata.write(
             mdata, (), 'view-key-properties', key_properties)
     mdata = metadata.write(mdata, (), 'is-view', is_view)
-    mdata = metadata.write(mdata, (), 'schema-name', db_schema)
+    mdata = metadata.write(mdata, (), 'schema-name', table_name)
     mdata = metadata.write(mdata, (), 'database-name', db_name)
     valid_rep_keys = []
 
     for c in cols:
         if c['type'] in DATETIME_TYPES:
-            valid_rep_keys.append(c['column'])
+            valid_rep_keys.append(c['name'])
 
         schema = schema_for_column(c)
 
         mdata = metadata.write(mdata,
-                               ('properties', c['column']),
+                               ('properties', c['name']),
                                'selected-by-default',
                                schema.inclusion != 'unsupported')
         mdata = metadata.write(mdata,
-                               ('properties', c['column']),
+                               ('properties', c['name']),
                                'sql-datatype',
                                c['type'].lower())
-        # TODO: Inclusion automatic should be used for primary and rep keys
         mdata = metadata.write(mdata,
-                               ('properties', c['column']),
+                               ('properties', c['name']),
                                'inclusion',
                                schema.inclusion)
     if valid_rep_keys:
@@ -209,12 +236,13 @@ def open_connection(config):
     return connection
 
 
-def execute(conn, query, params=tuple()):
+def select_all(conn, query, params):
     cur = conn.cursor()
     cur.execute(query, params)
-    column_specs = cur.fetchall() if cur.rowcount >= 0 else None
+    column_specs = cur.fetchall()
     cur.close()
     return column_specs
+
 
 def get_stream_version(tap_stream_id, state):
     return singer.get_bookmark(state,
