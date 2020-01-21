@@ -1,21 +1,19 @@
 import copy
+import datetime
+import pytz
+import ssl
+import sys
 import time
 from itertools import groupby
 
 import pendulum
-import datetime
-import pytz
-import sys
-import simplejson as json
-
 import psycopg2
+import simplejson as json
 import singer
 import singer.metrics as metrics
-from singer import metadata
-from singer import utils
+from singer import metadata, utils
 from singer.catalog import Catalog, CatalogEntry
 from singer.schema import Schema
-
 from tap_redshift import resolve
 
 __version__ = '1.0.0b9'
@@ -216,19 +214,20 @@ def create_column_metadata(
 
 
 def open_connection(config):
-    host = config['host'],
-    port = config['port'],
-    dbname = config['dbname'],
-    user = config['user'],
-    password = config['password']
+    psql_creds = {
+        "dbname": config["dbname"],
+        "user": config["user"],
+        "port": config["port"],
+        "password": config["password"],
+        "host": config["host"],
+    }
 
-    connection = psycopg2.connect(
-        host=host[0],
-        port=port[0],
-        dbname=dbname[0],
-        user=user[0],
-        password=password)
-    LOGGER.info('Connected to Redshift')
+    if config.get("ssl") == "true":
+        psql_creds["sslmode"] = "require"
+
+    connection = psycopg2.connect(**psql_creds)
+
+    LOGGER.info("Connected to Redshift")
     return connection
 
 
