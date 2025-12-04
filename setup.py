@@ -49,8 +49,8 @@ setup(
       install_requires=[
         'attrs==18.2.0',
         'pendulum==1.2.0',
-        'singer-python==5.0.4',
-        'backoff==1.3.2',
+        'singer-python==5.12.1',
+        'backoff==1.8.0',
         'psycopg2==2.9.11',
       ],
       setup_requires=[
